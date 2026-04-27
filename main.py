@@ -1,185 +1,365 @@
-"""
-FastAPI application for the Greater Support MCP bridge.
-
-This service exposes a minimal Model Conversation Protocol (MCP) interface over
-HTTP that allows a ChatGPT-based agent to create or update draft posts in a
-WordPress installation via the Greater Support Content Agent Connector plugin.
-
-It is deliberately restrictive: the only supported actions are draft
-creation/update, and there is no ability to publish, delete or otherwise
-manipulate content. All requests are authenticated using a bearer token and
-WordPress basic authentication configured via environment variables.
-"""
-
+import asyncio
+import json
 import os
-from typing import Any, AsyncIterator, Dict
+import uuid
+from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-#
-# These environment variables must be set in the hosting environment.  See the
-# accompanying README.md for details on how to configure them.
+WP_BASE_URL = os.environ.get("WP_BASE_URL", "").rstrip("/")
+WP_USERNAME = os.environ.get("WP_USERNAME", "")
+WP_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
+MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 
-WP_BASE_URL: str = os.environ.get("WP_BASE_URL", "")
-"""
-Base URL pointing at the Greater Support Content Agent Connector plugin.  The
-value should include the `/v1` suffix and normally looks like:
+app = FastAPI(title="Greater Support MCP Bridge", version="1.0.1")
 
-    https://greatersupport.com.au/wp-json/greater-support-content/v1
-
-This variable is required.  Without it the service cannot proxy requests to
-WordPress.
-"""
-
-WP_USERNAME: str = os.environ.get("WP_USERNAME", "")
-"""
-Username for a dedicated WordPress account with the Editor role.  This user
-should have the minimal permissions necessary to create and update draft
-content but not to publish or delete posts.
-"""
-
-WP_APP_PASSWORD: str = os.environ.get("WP_APP_PASSWORD", "")
-"""
-Application password associated with the WordPress Editor account.  WordPress
-application passwords can be generated in the user profile and should be used
-instead of the account's primary password.
-"""
-
-MCP_API_KEY: str = os.environ.get("MCP_API_KEY", "")
-"""
-Secret bearer token used to authenticate inbound requests from the agent.  The
-agent must send this key in the Authorization header as `Bearer <token>`.  If
-the token does not match this environment value the request will be rejected.
-"""
+sessions: Dict[str, asyncio.Queue] = {}
 
 
-def _require_env(var_name: str, value: str) -> None:
-    """Raise an exception if a required environment variable is missing."""
-    if not value:
-        raise RuntimeError(f"Environment variable {var_name} must be set")
+TOOLS = [
+    {
+        "name": "create_draft_post",
+        "description": (
+            "Create a WordPress draft post for Greater Support after human approval only. "
+            "This tool must never publish, delete, or modify live content."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Draft post title.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Draft post body content in plain text or HTML.",
+                },
+                "excerpt": {
+                    "type": "string",
+                    "description": "Optional short summary or excerpt.",
+                },
+                "slug": {
+                    "type": "string",
+                    "description": "Optional URL slug.",
+                },
+            },
+            "required": ["title", "content"],
+        },
+    },
+    {
+        "name": "update_draft_post",
+        "description": (
+            "Update an existing WordPress draft post for Greater Support after human approval only. "
+            "This tool must never publish, delete, or modify live content."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "post_id": {
+                    "type": "integer",
+                    "description": "WordPress draft post ID to update.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Updated draft post title.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Updated draft post body content in plain text or HTML.",
+                },
+                "excerpt": {
+                    "type": "string",
+                    "description": "Optional updated excerpt.",
+                },
+                "slug": {
+                    "type": "string",
+                    "description": "Optional updated URL slug.",
+                },
+            },
+            "required": ["post_id"],
+        },
+    },
+]
 
 
-# Validate environment configuration at import time.  This fails fast if
-# required settings are missing.
-_require_env("WP_BASE_URL", WP_BASE_URL)
-_require_env("WP_USERNAME", WP_USERNAME)
-_require_env("WP_APP_PASSWORD", WP_APP_PASSWORD)
-_require_env("MCP_API_KEY", MCP_API_KEY)
+def require_env() -> None:
+    missing = []
+    for key, value in {
+        "WP_BASE_URL": WP_BASE_URL,
+        "WP_USERNAME": WP_USERNAME,
+        "WP_APP_PASSWORD": WP_APP_PASSWORD,
+        "MCP_API_KEY": MCP_API_KEY,
+    }.items():
+        if not value:
+            missing.append(key)
+
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing required environment variables: {', '.join(missing)}",
+        )
 
 
-# ---------------------------------------------------------------------------
-# Application
-app = FastAPI(title="Greater Support MCP Bridge")
+def check_auth(request: Request) -> None:
+    require_env()
+
+    auth_header = request.headers.get("authorization", "")
+    x_api_key = request.headers.get("x-api-key", "")
+    query_key = request.query_params.get("api_key", "")
+
+    token = auth_header
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+
+    if token == MCP_API_KEY or x_api_key == MCP_API_KEY or query_key == MCP_API_KEY:
+        return
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-async def _wordpress_call(
-    path: str,
-    method: str = "GET",
-    payload: Dict[str, Any] | None = None,
-) -> Any:
-    """Proxy a request to the WordPress Content Agent Connector.
+async def call_wordpress(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+    require_env()
 
-    Args:
-        path: Path relative to WP_BASE_URL to call (e.g. "/posts/draft").
-        method: HTTP method to use (GET, POST or PUT).
-        payload: JSON payload for POST/PUT requests.
-
-    Returns:
-        The JSON-decoded response from WordPress.
-
-    Raises:
-        HTTPException: If the WordPress call fails or an invalid method is used.
-    """
     url = f"{WP_BASE_URL}{path}"
-    auth = (WP_USERNAME, WP_APP_PASSWORD)
-    async with httpx.AsyncClient() as client:
-        try:
-            if method == "GET":
-                response = await client.get(url, auth=auth)
-            elif method == "POST":
-                response = await client.post(url, json=payload, auth=auth)
-            elif method == "PUT":
-                response = await client.put(url, json=payload, auth=auth)
-            else:
-                raise HTTPException(status_code=400, detail=f"Unsupported method: {method}")
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"Error from WordPress: {exc}") from exc
-    return response.json()
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.request(
+            method,
+            url,
+            auth=(WP_USERNAME, WP_APP_PASSWORD),
+            json=payload,
+        )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"WordPress returned HTTP {response.status_code}: {response.text}"
+        )
+
+    try:
+        return response.json()
+    except Exception:
+        return {"ok": True, "raw": response.text}
+
+
+@app.get("/")
+async def root() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "service": "greater-support-mcp-bridge",
+        "routes": ["/health", "/capabilities", "/sse", "/messages"],
+    }
 
 
 @app.get("/health")
-async def health() -> Any:
-    """Report health of the WordPress Content Agent Connector."""
-    return await _wordpress_call("/health")
+async def health(request: Request) -> Any:
+    check_auth(request)
+    return await call_wordpress("GET", "/health")
 
 
 @app.get("/capabilities")
-async def capabilities() -> Any:
-    """List capabilities exposed by the WordPress Content Agent Connector."""
-    return await _wordpress_call("/capabilities")
+async def capabilities(request: Request) -> Any:
+    check_auth(request)
+    return await call_wordpress("GET", "/capabilities")
 
 
-@app.post("/sse")
-async def sse(
-    request: Request,
-    authorization: str = Header(default=""),
-) -> EventSourceResponse:
-    """Handle MCP requests and stream responses via Server‑Sent Events.
+@app.get("/sse")
+async def sse(request: Request) -> EventSourceResponse:
+    check_auth(request)
 
-    The agent sends a JSON payload with `action` and `data` fields.  This
-    endpoint validates the bearer token provided in the Authorization header
-    and then dispatches the action to WordPress accordingly.  Only a
-    restricted set of actions are supported.
-    """
-    # Validate Authorization header
-    token_prefix = "Bearer "
-    if not authorization.startswith(token_prefix):
-        raise HTTPException(status_code=401, detail="Authorization header missing or malformed")
-    token = authorization[len(token_prefix) :]
-    if token != MCP_API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid MCP API key")
+    session_id = str(uuid.uuid4())
+    queue: asyncio.Queue = asyncio.Queue()
+    sessions[session_id] = queue
 
-    # Parse request payload
-    try:
-        payload: Dict[str, Any] = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+    async def event_generator():
+        # MCP HTTP/SSE transport tells the client where to POST JSON-RPC messages.
+        yield {
+            "event": "endpoint",
+            "data": f"/messages?session_id={session_id}",
+        }
 
-    action = payload.get("action")
-    data: Dict[str, Any] = payload.get("data", {})
-
-    async def event_stream() -> AsyncIterator[Dict[str, Any]]:
-        """Generate events for SSE response."""
         try:
-            # Route based on action
-            if action == "createDraftPost":
-                # Call POST /posts/draft to create a new draft blog post
-                result = await _wordpress_call("/posts/draft", method="POST", payload=data)
-                yield {"event": "result", "data": result}
-            elif action == "updateDraftPost":
-                # Must provide an ID; update the specified draft post
-                post_id = data.get("id")
-                if not post_id:
-                    yield {"event": "error", "data": {"message": "Missing id for updateDraftPost"}}
-                else:
-                    result = await _wordpress_call(f"/posts/{post_id}", method="PUT", payload=data)
-                    yield {"event": "result", "data": result}
-            else:
-                yield {
-                    "event": "error",
-                    "data": {"message": f"Unsupported action: {action}"},
-                }
-        except Exception as exc:
-            # Catch any exception and emit an error event
-            yield {
-                "event": "error",
-                "data": {"message": str(exc)},
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    message = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield message
+                except asyncio.TimeoutError:
+                    yield {
+                        "event": "ping",
+                        "data": "{}",
+                    }
+        finally:
+            sessions.pop(session_id, None)
+
+    return EventSourceResponse(event_generator())
+
+
+@app.post("/messages")
+@app.post("/messages/")
+async def messages(request: Request) -> JSONResponse:
+    session_id = request.query_params.get("session_id")
+
+    if not session_id or session_id not in sessions:
+        # If the client posts without a valid session, require direct auth.
+        check_auth(request)
+
+    body = await request.json()
+    response = await handle_jsonrpc(body)
+
+    # Notifications do not require JSON-RPC responses.
+    if response is None:
+        return JSONResponse({"ok": True})
+
+    if session_id and session_id in sessions:
+        await sessions[session_id].put(
+            {
+                "event": "message",
+                "data": json.dumps(response),
+            }
+        )
+        return JSONResponse({"ok": True})
+
+    return JSONResponse(response)
+
+
+async def handle_jsonrpc(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    method = message.get("method")
+    request_id = message.get("id")
+    params = message.get("params") or {}
+
+    # MCP notifications do not need responses.
+    if method in {"notifications/initialized", "notifications/cancelled"}:
+        return None
+
+    try:
+        if method == "initialize":
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": params.get("protocolVersion", "2024-11-05"),
+                    "capabilities": {
+                        "tools": {
+                            "listChanged": False,
+                        }
+                    },
+                    "serverInfo": {
+                        "name": "greater-support-wordpress-drafts",
+                        "version": "1.0.1",
+                    },
+                },
             }
 
-    return EventSourceResponse(event_stream())
+        if method == "ping":
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {},
+            }
+
+        if method == "tools/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "tools": TOOLS,
+                },
+            }
+
+        if method == "tools/call":
+            tool_name = params.get("name")
+            arguments = params.get("arguments") or {}
+
+            result = await call_tool(tool_name, arguments)
+
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result),
+                        }
+                    ],
+                    "isError": False,
+                },
+            }
+
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32601,
+                "message": f"Method not found: {method}",
+            },
+        }
+
+    except Exception as exc:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32000,
+                "message": str(exc),
+            },
+        }
+
+
+async def call_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if tool_name == "create_draft_post":
+        title = arguments.get("title")
+        content = arguments.get("content")
+
+        if not title or not content:
+            raise ValueError("create_draft_post requires title and content.")
+
+        payload: Dict[str, Any] = {
+            "title": title,
+            "content": content,
+        }
+
+        for optional_key in ["excerpt", "slug"]:
+            if arguments.get(optional_key):
+                payload[optional_key] = arguments[optional_key]
+
+        wp_result = await call_wordpress("POST", "/draft", payload)
+
+        return {
+            "ok": True,
+            "action": "create_draft_post",
+            "wordpress_result": wp_result,
+            "message": "WordPress draft post created. Review in WordPress before publishing.",
+        }
+
+    if tool_name == "update_draft_post":
+        post_id = arguments.get("post_id")
+
+        if not post_id:
+            raise ValueError("update_draft_post requires post_id.")
+
+        payload: Dict[str, Any] = {}
+
+        for optional_key in ["title", "content", "excerpt", "slug"]:
+            if arguments.get(optional_key):
+                payload[optional_key] = arguments[optional_key]
+
+        if not payload:
+            raise ValueError("update_draft_post requires at least one field to update.")
+
+        wp_result = await call_wordpress("PATCH", f"/draft/{post_id}", payload)
+
+        return {
+            "ok": True,
+            "action": "update_draft_post",
+            "wordpress_result": wp_result,
+            "message": "WordPress draft post updated. Review in WordPress before publishing.",
+        }
+
+    raise ValueError(f"Unknown tool: {tool_name}")
