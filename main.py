@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -11,11 +12,19 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 
+# ---------------------------------------------------------------------
+# Environment variables set in Fly.io
+# ---------------------------------------------------------------------
+
 WP_BASE_URL = os.environ.get("WP_BASE_URL", "").rstrip("/")
 WP_USERNAME = os.environ.get("WP_USERNAME", "")
 WP_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 
+
+# ---------------------------------------------------------------------
+# Environment / auth helpers
+# ---------------------------------------------------------------------
 
 def require_env() -> None:
     missing = [
@@ -36,11 +45,12 @@ def require_env() -> None:
 
 
 def token_is_valid(request: Request) -> bool:
-    auth_header = request.headers.get("authorization", "")
-    x_api_key = request.headers.get("x-api-key", "")
-    query_key = request.query_params.get("api_key", "")
+    auth_header = request.headers.get("authorization", "").strip()
+    x_api_key = request.headers.get("x-api-key", "").strip()
+    query_key = request.query_params.get("api_key", "").strip()
 
-    token = auth_header.strip()
+    token = auth_header
+
     if auth_header.lower().startswith("bearer "):
         token = auth_header[7:].strip()
 
@@ -53,25 +63,33 @@ def token_is_valid(request: Request) -> bool:
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Keep root public so Fly health/root checks do not fail.
+        # Keep root public so browser/Fly checks can confirm the service is alive.
         if request.url.path == "/":
             return await call_next(request)
 
-        # Protect direct checks and MCP routes.
-        protected_paths = (
+        # Protect the entry routes. Do NOT protect /messages here because
+        # the MCP SDK uses it internally after the authenticated /sse session starts.
+        protected_prefixes = (
             "/sse",
-            "/messages",
             "/health",
             "/capabilities",
         )
 
-        if request.url.path.startswith(protected_paths):
+        if request.url.path.startswith(protected_prefixes):
             require_env()
+
             if not token_is_valid(request):
-                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+                return JSONResponse(
+                    {"error": "Unauthorized"},
+                    status_code=401,
+                )
 
         return await call_next(request)
 
+
+# ---------------------------------------------------------------------
+# WordPress proxy helper
+# ---------------------------------------------------------------------
 
 async def wordpress_request(
     method: str,
@@ -98,11 +116,47 @@ async def wordpress_request(
     try:
         return response.json()
     except Exception:
-        return {"ok": True, "raw": response.text}
+        return {
+            "ok": True,
+            "raw": response.text,
+        }
 
 
-mcp = FastMCP("Greater Support WordPress Drafts")
+# ---------------------------------------------------------------------
+# MCP server configuration
+# ---------------------------------------------------------------------
 
+transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        "greater-support-mcp-bridge.fly.dev",
+        "greater-support-mcp-bridge.fly.dev:443",
+        "greater-support-mcp-bridge.fly.dev:*",
+        "localhost",
+        "localhost:*",
+        "127.0.0.1",
+        "127.0.0.1:*",
+        "0.0.0.0",
+        "0.0.0.0:*",
+        "[::1]",
+        "[::1]:*",
+    ],
+    allowed_origins=[
+        "https://platform.openai.com",
+        "https://chatgpt.com",
+        "https://chat.openai.com",
+    ],
+)
+
+mcp = FastMCP(
+    name="Greater Support WordPress Drafts",
+    transport_security=transport_security,
+)
+
+
+# ---------------------------------------------------------------------
+# MCP tools exposed to Agent Builder
+# ---------------------------------------------------------------------
 
 @mcp.tool()
 async def create_draft_post(
@@ -114,7 +168,8 @@ async def create_draft_post(
     """
     Create a WordPress draft post for Greater Support after human approval only.
 
-    This tool must never publish, delete, or modify live content.
+    This tool creates draft content only. It must never publish, delete,
+    or modify live content.
     """
     if not title or not content:
         raise ValueError("title and content are required.")
@@ -151,7 +206,8 @@ async def update_draft_post(
     """
     Update an existing WordPress draft post for Greater Support after human approval only.
 
-    This tool must never publish, delete, or modify live content.
+    This tool updates draft content only. It must never publish, delete,
+    or modify live content.
     """
     if not post_id:
         raise ValueError("post_id is required.")
@@ -183,14 +239,26 @@ async def update_draft_post(
     }
 
 
+# ---------------------------------------------------------------------
+# Normal HTTP routes for testing
+# ---------------------------------------------------------------------
+
 async def root(request: Request) -> Response:
     return JSONResponse(
         {
             "ok": True,
             "service": "greater-support-mcp-bridge",
             "mcp_url": "/sse",
-            "routes": ["/", "/health", "/capabilities", "/sse"],
-            "tools": ["create_draft_post", "update_draft_post"],
+            "routes": [
+                "/",
+                "/health",
+                "/capabilities",
+                "/sse",
+            ],
+            "tools": [
+                "create_draft_post",
+                "update_draft_post",
+            ],
         }
     )
 
@@ -204,6 +272,10 @@ async def capabilities(request: Request) -> Response:
     result = await wordpress_request("GET", "/capabilities")
     return JSONResponse(result)
 
+
+# ---------------------------------------------------------------------
+# ASGI app for Fly.io / uvicorn
+# ---------------------------------------------------------------------
 
 app = Starlette(
     routes=[
